@@ -5342,3 +5342,80 @@ BT /F1 12 Tf 385.6 522 Td (61) Tj ET";
         "entries interleaved into a paragraph: {md}"
     );
 }
+
+const LABEL_VALUE_FIELDS: [(&str, &str); 14] = [
+    ("Type of entity", "Public company"),
+    ("Registration number", "2019/0442"),
+    ("Name of reporting entity", "ACME HOLDINGS"),
+    ("Listing status", "Listed"),
+    ("Short code", "ACME"),
+    ("Sector", "Industrials"),
+    ("Sub-sector", "Machinery"),
+    ("Reporting period frequency", "Annual"),
+    (
+        "Whether the reporting entity is preparing statements for its first period",
+        "No",
+    ),
+    ("Reporting period start date", "01/01/2025"),
+    ("Reporting period end date", "31/12/2025"),
+    ("Description of reporting currency", "Euro"),
+    ("Level of rounding off for monetary values", "Thousands"),
+    ("Preparation format", "Consolidated"),
+];
+
+/// One field per line from `top` down, label at x = 34 and value at x = 324,
+/// set at 7pt. One label runs most of the way to the value column.
+fn label_value_rows(top: i32) -> String {
+    let mut content = String::new();
+    for (row, (label, value)) in LABEL_VALUE_FIELDS.iter().enumerate() {
+        let y = top - 10 * row as i32;
+        content.push_str(&format!(
+            "BT /F1 7 Tf 34 {y} Td ({label}) Tj ET\nBT /F1 7 Tf 324 {y} Td ({value}) Tj ET\n"
+        ));
+    }
+    content
+}
+
+fn assert_label_value_rows(md: &str) {
+    for (label, value) in LABEL_VALUE_FIELDS {
+        assert!(
+            md.contains(&format!("|{label}|{value}|")),
+            "missing row {label:?} -> {value:?} in {md}"
+        );
+    }
+    assert!(
+        !md.contains("Type of entity Public company"),
+        "fields flowed into a paragraph: {md}"
+    );
+}
+
+#[test]
+fn test_two_column_label_value_page_renders_one_row_per_field() {
+    // A form-style information page: a section heading, then the fields set
+    // smaller than the heading. Each label must stay paired with its value
+    // on one row, not flow into a paragraph of labels and values.
+    let content = format!(
+        "BT /F1 10 Tf 24 790 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 776 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(766)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}
+
+#[test]
+fn test_label_value_rows_under_a_shaded_title_band_keep_their_first_fields() {
+    // The page title sits in a two-by-two grid of shaded cells whose bottom
+    // edge is within a line or two of the first fields. The grid holds no
+    // table, and the fields next to it must still join the rows below.
+    let content = format!(
+        "0.9 g 25 772 399 11 re f 424 772 126 11 re f 25 783 399 11 re f 424 783 126 11 re f 0 g\n\
+BT /F1 10 Tf 30 785 Td (Report information) Tj ET\n\
+BT /F1 7 Tf 26 774 Td (General information about the statements) Tj ET\n{}",
+        label_value_rows(764)
+    );
+    let buf = make_text_pdf(&content, "0 0 595 842");
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert_label_value_rows(&md);
+}

@@ -1715,6 +1715,9 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
     if pct_data > min_pct || num_cols >= 3 {
         return true;
     }
+    if is_label_value_list(cells) {
+        return true;
+    }
     if num_cols == 2 && matches!(mode, TableDetectionMode::BodyFont) {
         let non_empty: Vec<usize> = cells
             .iter()
@@ -1729,6 +1732,42 @@ fn has_table_like_content(cells: &[Vec<String>], mode: TableDetectionMode) -> bo
         }
     }
     false
+}
+
+/// A form-style field list: one label and one short value per line, as on a
+/// report's information page. The cells carry little numeric data, so the
+/// content check would otherwise fail them in either detection mode, and
+/// column flow then separates every label from its value.
+///
+/// Lengths are judged by their median so a single long label — one that runs
+/// most of the way to the value column — does not disqualify the block, while
+/// two columns of running text, whose lines fill their column, still do.
+fn is_label_value_list(cells: &[Vec<String>]) -> bool {
+    const MIN_FIELDS: usize = 6;
+    if cells.first().map(|r| r.len()) != Some(2) {
+        return false;
+    }
+    let mut labels = Vec::new();
+    let mut values = Vec::new();
+    for row in cells {
+        let (label, value) = (row[0].trim(), row[1].trim());
+        if label.is_empty() || value.is_empty() {
+            continue;
+        }
+        labels.push(label.chars().count());
+        values.push(value.chars().count());
+        if label.ends_with(['.', ',', ';']) || value.ends_with(['.', ',', ';']) {
+            return false;
+        }
+    }
+    if labels.len() < MIN_FIELDS || labels.len() * 5 < cells.len() * 4 {
+        return false;
+    }
+    let median = |lens: &mut Vec<usize>| {
+        lens.sort_unstable();
+        lens[lens.len() / 2]
+    };
+    median(&mut labels) <= 60 && median(&mut values) <= 25
 }
 
 /// Check if a cell value looks like table data
@@ -4026,5 +4065,82 @@ mod tests {
             vec!["Section D".into(), "TBD".into()],
         ];
         assert!(!is_page_number_toc(&cells));
+    }
+
+    fn rows(pairs: &[(&str, &str)]) -> Vec<Vec<String>> {
+        pairs
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect()
+    }
+
+    #[test]
+    fn label_value_list_passes_the_content_check_despite_one_long_label() {
+        let cells = rows(&[
+            ("Section information", ""),
+            ("Type of entity", "Public company"),
+            ("Registration number", "2019/0442"),
+            ("Name of reporting entity", "ACME HOLDINGS"),
+            ("Listing status", "Listed"),
+            (
+                "Whether the reporting entity is preparing statements for its first financial period since it was established",
+                "No",
+            ),
+            ("Description of reporting currency", "Euro"),
+            ("Level of rounding off for monetary values", "Thousands"),
+        ]);
+        assert!(is_label_value_list(&cells));
+        assert!(has_table_like_content(
+            &cells,
+            TableDetectionMode::SmallFont
+        ));
+    }
+
+    #[test]
+    fn parallel_prose_columns_are_not_a_label_value_list() {
+        let cells = rows(&[
+            (
+                "The committee met four times during the year",
+                "and reviewed the budget for the coming period",
+            ),
+            (
+                "to consider the proposals put forward by the",
+                "with particular attention to the costs of the",
+            ),
+            (
+                "members, and agreed that further work was",
+                "new building, which had risen since the last",
+            ),
+            (
+                "needed before a decision could be taken on",
+                "estimate was prepared by the finance office",
+            ),
+            (
+                "the question of the annual subscription",
+                "and circulated to members in the spring",
+            ),
+            (
+                "which has not changed for several years",
+                "ahead of the general meeting in June",
+            ),
+        ]);
+        assert!(!is_label_value_list(&cells));
+        assert!(!has_table_like_content(
+            &cells,
+            TableDetectionMode::SmallFont
+        ));
+    }
+
+    #[test]
+    fn a_short_value_column_beside_sentences_is_not_a_label_value_list() {
+        let cells = rows(&[
+            ("The first meeting was held in the spring.", "Note 1"),
+            ("Members agreed the budget for the year.", "Note 2"),
+            ("The finance office prepared the estimate.", "Note 3"),
+            ("A revised plan was circulated in June.", "Note 4"),
+            ("The subscription was left unchanged.", "Note 5"),
+            ("The next meeting is set for the autumn.", "Note 6"),
+        ]);
+        assert!(!is_label_value_list(&cells));
     }
 }
