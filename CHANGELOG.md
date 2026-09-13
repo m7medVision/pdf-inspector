@@ -26,6 +26,14 @@ version and date. Earlier releases are described in their
   label long enough to run most of the way to the value column no longer
   rules the block out, and a list whose first fields sit beside a shaded title
   band keeps those fields in the table.
+- Lines of small type stacked less than an em apart — a column header
+  wrapped onto two lines in a 6pt statement table — are no longer woven
+  together glyph by glyph into one run such as `(0d1e/0fi1c/i2t0)25-`.
+- A table of figures whose column headers wrap onto several staggered lines
+  above the first row gets those lines joined per column into its header
+  row, instead of leaving them before the table as a bold paragraph; the
+  first body row after skipped header rows is no longer repeated as a
+  paragraph.
 
 ## [1.19.0] - 2026-09-09
 

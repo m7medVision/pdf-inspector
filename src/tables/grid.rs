@@ -449,6 +449,213 @@ pub(crate) fn recover_header_row(
     table.item_indices.extend(header_indices);
 }
 
+const MAX_HEADER_LINES: usize = 8;
+
+/// Recover column headers that wrap onto several lines above a table's first
+/// row and were left out of it.
+///
+/// A header set in small type over narrow columns ("Retained earnings" over
+/// "(accumulated losses)" over a period split after its dash) stacks lines
+/// closer together than the table's rows, with the lines of neighbouring
+/// columns on staggered baselines. Row clustering cannot make one row of
+/// that, so the detector drops those rows and they fall back into the text
+/// flow as a paragraph. Here each line above the table is assigned to a
+/// column by where it sits over the body text, and the lines are joined top
+/// to bottom within their column into one header row.
+///
+/// The block is the run of lines directly above the first row, no further
+/// apart than the rows themselves, in which every item lands in exactly one
+/// column. Label-only lines between the header and the first row are section
+/// rows and join the body. Nothing changes unless the table's values are
+/// figures and the header reaches at least two data columns and half of
+/// them. Columns left with no text in any row, cluster positions seeded by
+/// the header's left edges, are dropped.
+pub(crate) fn recover_wrapped_column_headers(
+    table: &mut Table,
+    items: &[TextItem],
+    claimed: &std::collections::HashSet<usize>,
+) {
+    let column_count = table.columns.len();
+    if column_count < 3 || table.rows.len() < 2 {
+        return;
+    }
+
+    let mut extents: Vec<Option<(f32, f32)>> = vec![None; column_count];
+    let mut font_sizes = Vec::new();
+    for &index in &table.item_indices {
+        let item = &items[index];
+        if let Some(column) = find_column_index(&table.columns, item.x) {
+            let extent = extents[column].get_or_insert((item.x, item.x + item.width));
+            extent.0 = extent.0.min(item.x);
+            extent.1 = extent.1.max(item.x + item.width);
+        }
+        font_sizes.push(item.font_size);
+    }
+    let data_columns = extents.iter().skip(1).filter(|e| e.is_some()).count();
+    if extents[0].is_none() || data_columns < 2 || font_sizes.is_empty() {
+        return;
+    }
+    // Only figures under labels: in a table of wrapped prose the lines above
+    // the first row are as likely the previous rows of another grid.
+    let values: Vec<&str> = table
+        .cells
+        .iter()
+        .flat_map(|row| row.iter().skip(1))
+        .map(|cell| cell.trim())
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    let figures = values
+        .iter()
+        .filter(|v| is_numeric_text(v.trim_start_matches('(').trim_end_matches(')')))
+        .count();
+    if values.is_empty() || (figures as f32) < values.len() as f32 * 0.8 {
+        return;
+    }
+    font_sizes.sort_by(|a, b| a.total_cmp(b));
+    let font_size = font_sizes[font_sizes.len() / 2];
+    if font_size <= 0.0 {
+        return;
+    }
+    let mut pitches: Vec<f32> = table.rows.windows(2).map(|w| w[0] - w[1]).collect();
+    pitches.sort_by(|a, b| a.total_cmp(b));
+    let max_gap = (pitches[pitches.len() / 2] * 1.25).max(font_size * 1.5);
+    // Columns split at the middle of the gap between their body texts. A
+    // header is centred on, left-aligned over or right-aligned over its
+    // column's values, so its centre lands in that column's span, but it
+    // must not reach over another column's values: that is a spanning
+    // header, which has no single column.
+    let present: Vec<(usize, f32, f32)> = extents
+        .iter()
+        .enumerate()
+        .filter_map(|(c, e)| e.map(|(a, b)| (c, a, b)))
+        .collect();
+    let column_of = |item: &TextItem| -> Option<usize> {
+        let (left, right) = (item.x, item.x + item.width);
+        let centre = (left + right) / 2.0;
+        let slot = present
+            .windows(2)
+            .position(|w| centre < (w[0].2 + w[1].1) / 2.0);
+        let (column, _, _) = present[slot.unwrap_or(present.len() - 1)];
+        let reaches_other = present
+            .iter()
+            .any(|&(c, a, b)| c != column && right > a && left < b);
+        (!reaches_other).then_some(column)
+    };
+
+    let in_table: std::collections::HashSet<usize> = table.item_indices.iter().copied().collect();
+    let first_row_y = table.rows[0];
+    let mut candidates: Vec<usize> = (0..items.len())
+        .filter(|i| {
+            let item = &items[*i];
+            !in_table.contains(i)
+                && !claimed.contains(i)
+                && !item.text.trim().is_empty()
+                && item.is_upright()
+                && item.line_y() > first_row_y + font_size * 0.3
+                && item.font_size >= font_size * 0.75
+                && item.font_size <= font_size * 1.35
+        })
+        .collect();
+    candidates.sort_by(|a, b| items[*a].line_y().total_cmp(&items[*b].line_y()));
+
+    // Lines ascending from the table, each a list of (item, column).
+    let mut lines: Vec<(f32, Vec<(usize, usize)>)> = Vec::new();
+    let mut previous_y = first_row_y;
+    let mut rest = candidates.as_slice();
+    while let Some(&first) = rest.first() {
+        let y = items[first].line_y();
+        if y - previous_y > max_gap {
+            break;
+        }
+        let end = rest
+            .iter()
+            .position(|&i| items[i].line_y() - y > font_size * 0.3)
+            .unwrap_or(rest.len());
+        let Some(line) = rest[..end]
+            .iter()
+            .map(|&i| column_of(&items[i]).map(|c| (i, c)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            break;
+        };
+        lines.push((y, line));
+        previous_y = y;
+        rest = &rest[end..];
+        if lines.len() == MAX_HEADER_LINES {
+            break;
+        }
+    }
+
+    let label_only = |line: &[(usize, usize)]| line.iter().all(|&(_, c)| c == 0);
+    let section_count = lines.iter().take_while(|(_, l)| label_only(l)).count();
+    while lines.len() > section_count && lines.last().is_some_and(|(_, l)| label_only(l)) {
+        lines.pop();
+    }
+    let header_lines = &lines[section_count..];
+    let mut header_parts: Vec<Vec<&TextItem>> = vec![Vec::new(); column_count];
+    for &(index, column) in header_lines.iter().flat_map(|(_, l)| l) {
+        header_parts[column].push(&items[index]);
+    }
+    let headed = header_parts
+        .iter()
+        .skip(1)
+        .filter(|p| !p.is_empty())
+        .count();
+    if headed < 2 || headed * 2 < data_columns {
+        return;
+    }
+
+    let mut header = Vec::with_capacity(column_count);
+    for parts in &mut header_parts {
+        parts.sort_by(|a, b| b.line_y().total_cmp(&a.line_y()).then(a.x.total_cmp(&b.x)));
+        let mut text = String::new();
+        for part in parts.iter() {
+            if !text.is_empty() && !text.ends_with('-') {
+                text.push(' ');
+            }
+            text.push_str(part.text.trim());
+        }
+        header.push(text);
+    }
+
+    for (y, line) in lines[..section_count].iter() {
+        let mut parts: Vec<&TextItem> = line.iter().map(|&(i, _)| &items[i]).collect();
+        parts.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let mut row = vec![String::new(); column_count];
+        row[0] = parts
+            .iter()
+            .map(|p| p.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        table.rows.insert(0, *y);
+        table.cells.insert(0, row);
+    }
+    let header_y = header_lines.last().map_or(first_row_y, |(y, _)| *y);
+    table.rows.insert(0, header_y);
+    table.cells.insert(0, header);
+    table
+        .item_indices
+        .extend(lines.iter().flat_map(|(_, l)| l.iter().map(|&(i, _)| i)));
+
+    let keep: Vec<bool> = (0..column_count)
+        .map(|c| table.cells.iter().any(|row| !row[c].trim().is_empty()))
+        .collect();
+    if keep.iter().any(|k| !k) {
+        let mut column = 0;
+        table.columns.retain(|_| {
+            column += 1;
+            keep[column - 1]
+        });
+        for row in &mut table.cells {
+            let mut column = 0;
+            row.retain(|_| {
+                column += 1;
+                keep[column - 1]
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
