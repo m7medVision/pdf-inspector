@@ -1231,18 +1231,22 @@ fn merge_text_items_with_clips(
         .filter_map(|(item, clip)| clip.map(|rect| (item as *const TextItem, rect)))
         .collect();
 
-    // Group items by (page, Y position) with 5pt tolerance
-    let y_tolerance = 5.0;
-    let mut line_groups: Vec<(u32, f32, Vec<&TextItem>)> = Vec::new();
+    // Group items by (page, Y position) with a 5pt tolerance, narrowed to half
+    // an em for small type: two lines of 6pt text can sit 8pt apart, and a
+    // band that reaches both of them sorts their glyphs into one interleaved
+    // run. Baselines half an em apart are never one line of that size.
+    let mut line_groups: Vec<(u32, f32, f32, Vec<&TextItem>)> = Vec::new();
 
     for item in &items {
-        let found = line_groups
-            .iter_mut()
-            .find(|(pg, y, _)| *pg == item.page && (item.y - *y).abs() < y_tolerance);
-        if let Some((_, _, group)) = found {
+        let found = line_groups.iter_mut().find(|(pg, y, size, _)| {
+            let em = item.font_size.max(*size);
+            let y_tolerance = if em > 0.0 { 5.0_f32.min(em * 0.5) } else { 5.0 };
+            *pg == item.page && (item.y - *y).abs() < y_tolerance
+        });
+        if let Some((_, _, _, group)) = found {
             group.push(item);
         } else {
-            line_groups.push((item.page, item.y, vec![item]));
+            line_groups.push((item.page, item.y, item.font_size, vec![item]));
         }
     }
 
@@ -1250,7 +1254,7 @@ fn merge_text_items_with_clips(
 
     // Sort each group by X position (direction-aware), except for lines whose
     // content stream intentionally backtracks to overlay ActualText fragments.
-    for (page, y, mut group) in line_groups {
+    for (page, y, _, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
         if rtl {
@@ -3554,6 +3558,29 @@ mod tests {
             mcid: None,
             baseline_shift: 0.0,
         }
+    }
+
+    /// One glyph per item, each advancing by `step`, all at baseline `y`.
+    fn glyphs_at(text: &str, x: f32, y: f32, step: f32, font_size: f32) -> Vec<TextItem> {
+        text.chars()
+            .enumerate()
+            .map(|(i, c)| make_item_fs(&c.to_string(), x + step * i as f32, y, step, font_size))
+            .collect()
+    }
+
+    #[test]
+    fn stacked_small_type_lines_are_not_interleaved() {
+        // A wrapped column header in 6pt type: "(deficit)" over "01/01/2025-",
+        // one glyph per show op, baselines 8.25pt apart. A line drawn earlier
+        // at 553pt sits within 5pt of both, so a fixed 5pt band gathers the
+        // two lines together and the x-sort weaves their glyphs into one run.
+        let mut items = glyphs_at("Statement", 24.8, 553.0, 2.8, 6.0);
+        items.extend(glyphs_at("(deficit)", 442.5, 557.1, 3.0, 6.0));
+        items.extend(glyphs_at("01/01/2025-", 442.5, 548.9, 3.0, 6.0));
+        let merged = merge_text_items(items);
+        let texts: Vec<&str> = merged.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"(deficit)"), "{texts:?}");
+        assert!(texts.contains(&"01/01/2025-"), "{texts:?}");
     }
 
     #[test]
