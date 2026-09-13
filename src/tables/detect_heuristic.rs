@@ -7,7 +7,7 @@ use super::cell_text::join_cell_items;
 use super::financial::try_split_financial_item;
 use super::grid::{
     find_column_boundaries, find_column_index, find_row_boundaries, find_row_index,
-    recover_header_row,
+    recover_header_row, recover_wrapped_column_headers,
 };
 use super::{Table, TableDetectionMode};
 
@@ -642,8 +642,10 @@ pub(crate) fn detect_tables_with_page_width(
                     script_flags[i]
                 })
             {
+                let rows_before_header = table.rows.len();
                 // Try to recover body-font header row above the small-font table
                 recover_header_row(&mut table, items, table_font_threshold);
+                let body_font_header = table.rows.len() > rows_before_header;
                 // Try to recover a label column from unclaimed items to the left
                 try_add_label_column(
                     &mut table,
@@ -652,6 +654,9 @@ pub(crate) fn detect_tables_with_page_width(
                     y_min,
                     y_max,
                 );
+                if !body_font_header {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
+                }
                 for &idx in &table.item_indices {
                     claimed_indices.insert(idx);
                 }
@@ -723,11 +728,12 @@ pub(crate) fn detect_tables_with_page_width(
                     continue;
                 }
 
-                if let Some(table) =
+                if let Some(mut table) =
                     detect_table_in_region(&region_items, TableDetectionMode::BodyFont, &|i| {
                         body_script_flags[i]
                     })
                 {
+                    recover_wrapped_column_headers(&mut table, items, &claimed_indices);
                     tables.push(table);
                 }
             }
@@ -2493,16 +2499,13 @@ pub(crate) fn find_first_table_row(
         // Otherwise skip this sparse row
     }
 
-    // Collect item indices from excluded rows
+    // Collect item indices from excluded rows. An item belongs to the row it was assigned to, not to every skipped row
+    // within reach: small type sets rows closer than any fixed tolerance, and
+    // excluding the first kept row's items prints that row twice.
     if first_table_row > 0 {
-        let y_tolerance = 15.0;
         for (idx, item) in original_items {
-            // Check if this item is in one of the excluded rows
-            for row_y in rows.iter().take(first_table_row) {
-                if (item.y - *row_y).abs() < y_tolerance {
-                    excluded_items.insert(*idx);
-                    break;
-                }
+            if find_row_index(rows, item.line_y()).is_some_and(|row| row < first_table_row) {
+                excluded_items.insert(*idx);
             }
         }
     }
