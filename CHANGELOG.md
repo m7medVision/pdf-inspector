@@ -16,6 +16,12 @@ version and date. Earlier releases are described in their
   their own lines — is rendered as a contents list, one entry per line with
   its page number tab-separated, instead of being read as a two-column page
   whose titles and numbers interleave into a paragraph.
+- A two-column field list — one label and one short value per line, as on a
+  form or information page — is rendered as a two-column table instead of
+  being split into a paragraph of labels and a paragraph of values. A single
+  label long enough to run most of the way to the value column no longer
+  rules the block out, and a list whose first fields sit beside a shaded title
+  band keeps those fields in the table.
 
 ## [1.19.0] - 2026-09-09
 
