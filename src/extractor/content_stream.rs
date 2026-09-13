@@ -170,6 +170,12 @@ pub(crate) fn estimated_string_advance_ts(
 /// Superscripts, signs, joining punctuation and right-to-left runs keep the
 /// items other stages already handle. The state belongs to one content
 /// stream: a run at a Form XObject boundary is dropped, as before.
+///
+/// Glyph-by-glyph producers (browser print-to-PDF) paint every glyph, space
+/// included, as its own run at a hinted whole-pixel advance. Their spaces
+/// are not squeezed, but the gaps between letters stray as far as a space
+/// does, so geometry alone cannot find the words: a space run between two
+/// single-glyph items is kept whatever its width.
 pub(crate) struct PendingSpace {
     /// Index of the item the run follows.
     after: usize,
@@ -177,6 +183,9 @@ pub(crate) struct PendingSpace {
     x_end: f32,
     y: f32,
     em: f32,
+    /// The run is too wide to count as squeezed and was kept only because
+    /// it follows a single glyph.
+    between_glyphs: bool,
 }
 
 /// Space runs narrower than this many em are invisible to gap detection:
@@ -189,6 +198,12 @@ const SQUEEZED_SPACE_EM: f32 = 0.2;
 /// digits of a left-to-right script.
 fn takes_word_space(c: char) -> bool {
     c.is_alphanumeric() && !crate::text_utils::is_rtl_char(c)
+}
+
+/// Between single glyphs a painted space is a word space next to punctuation
+/// too ("STATEMENTS, 2025"): those runs have no other word-boundary evidence.
+fn takes_glyph_space(c: char) -> bool {
+    !c.is_whitespace() && !crate::text_utils::is_rtl_char(c)
 }
 
 impl PendingSpace {
@@ -216,20 +231,36 @@ impl PendingSpace {
         if last.page != page || !matches!(last.item_type, ItemType::Text) || !last.is_upright() {
             return None;
         }
-        if !last.text.chars().last().is_some_and(takes_word_space) {
-            return None;
-        }
         let em = last.font_size.abs();
         if em <= 0.0 || !run.is_upright() || run.width <= 0.0 {
             return None;
         }
-        if run.width >= em * SQUEEZED_SPACE_EM || (run.y - last.y).abs() > em * 0.2 {
+        let between_glyphs = run.width >= em * SQUEEZED_SPACE_EM;
+        if between_glyphs && !super::is_bare_glyph(&last.text) {
+            return None;
+        }
+        let takes_space = if between_glyphs {
+            takes_glyph_space
+        } else {
+            takes_word_space
+        };
+        if !last.text.chars().last().is_some_and(takes_space) {
+            return None;
+        }
+        if (run.y - last.y).abs() > em * 0.2 {
             return None;
         }
         // The run must start where the previous item ends: a space painted
         // a column away is layout, not this item's word space.
         let gap = run.x - (last.x + last.width);
-        if !(-em * 0.1..=em * 0.5).contains(&gap) {
+        // A kerned space ("L" then space) can start well inside the glyph's
+        // declared box; between glyphs it only has to follow the glyph.
+        let follows = if between_glyphs {
+            run.x > last.x
+        } else {
+            gap >= -em * 0.1
+        };
+        if !follows || gap > em * 0.5 {
             return None;
         }
         Some(Self {
@@ -237,6 +268,7 @@ impl PendingSpace {
             x_end: run.x + run.width,
             y: run.y,
             em,
+            between_glyphs,
         })
     }
 
@@ -247,7 +279,15 @@ impl PendingSpace {
         if self.after + 1 != items.len() || !next.is_upright() {
             return;
         }
-        if !text.chars().next().is_some_and(takes_word_space) {
+        let takes_space = if self.between_glyphs {
+            if !super::is_bare_glyph(text) {
+                return;
+            }
+            takes_glyph_space
+        } else {
+            takes_word_space
+        };
+        if !text.chars().next().is_some_and(takes_space) {
             return;
         }
         let em = self.em;
@@ -3929,6 +3969,25 @@ BT /F1 10 Tf 300 30 Td (7) Tj ET";
             let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
             assert_eq!(texts, [expected], "{content}");
         }
+    }
+
+    /// Glyph-by-glyph layout at hinted advances: every letter sits 0.16 em
+    /// past its declared width, over the word-space thresholds, and the
+    /// 0.3 em space runs between words are the only word boundaries.
+    #[test]
+    fn wide_space_runs_between_single_glyphs_carry_the_word_spaces() {
+        let mut content = String::from("BT /F1 10 Tf 100 700 Td ");
+        for glyph in "Name of the entity".chars() {
+            if glyph == ' ' {
+                content.push_str("-3 Tc ( ) Tj 0 Tc 3 0 Td ");
+            } else {
+                content.push_str(&format!("({glyph}) Tj 7.6 0 Td "));
+            }
+        }
+        content.push_str("ET");
+        let items = extract_simple_items(content.as_bytes());
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["Name of the entity"]);
     }
 
     /// A space run wide enough to be seen as a gap (0.6 em here) is left to

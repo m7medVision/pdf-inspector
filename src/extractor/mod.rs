@@ -1211,6 +1211,53 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// Widest gap, in em, that a hinted whole-pixel advance leaves between two
+/// glyphs of one word. Hinting at small pixel sizes widens a glyph by up to
+/// a pixel and more (Times Bold "Q" at 8px: 6.2px declared, 8px laid out, a
+/// 0.22 em gap), as wide as a word space, so these gaps only stay unspaced on
+/// pages whose word spaces are painted and so already carried by the items.
+const HINTED_GLYPH_RESIDUAL_EM: f32 = 0.3;
+
+/// One visible glyph, with no space around it.
+pub(crate) fn is_bare_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(|c| !c.is_whitespace()) && chars.next().is_none()
+}
+
+/// Right-to-left glyphs take no rescued space (see `PendingSpace`), so their
+/// word boundaries are still found from the gaps.
+fn is_bare_ltr_glyph(text: &str) -> bool {
+    is_bare_glyph(text) && !text.chars().any(crate::text_utils::is_rtl_char)
+}
+
+/// Pages laid out glyph by glyph whose word spaces are painted: extraction
+/// hands a painted space to the glyph before it (`PendingSpace`), so such a
+/// page shows glyph items with a trailing space among runs of bare glyphs.
+/// A handful of spaced glyphs is not enough on its own: word-per-`Tj`
+/// producers emit "a " and "I " too, but not letter after bare letter.
+fn pages_painting_glyph_spaces(groups: &[(u32, f32, Vec<&TextItem>, bool)]) -> HashSet<u32> {
+    const MIN_SPACED_GLYPHS: usize = 3;
+    let mut counts: HashMap<u32, (usize, usize)> = HashMap::new();
+    for (page, _, group, _) in groups {
+        let (spaced, bare_pairs) = counts.entry(*page).or_default();
+        for item in group {
+            if item.text.ends_with(' ') && is_bare_glyph(item.text.trim_end()) {
+                *spaced += 1;
+            }
+        }
+        for pair in group.windows(2) {
+            if is_bare_glyph(&pair[0].text) && is_bare_glyph(pair[1].text.trim_end()) {
+                *bare_pairs += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter(|(_, (spaced, bare_pairs))| *spaced >= MIN_SPACED_GLYPHS && bare_pairs >= spaced)
+        .map(|(page, _)| page)
+        .collect()
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     merge_text_items_with_clips(items, &[])
 }
@@ -1268,9 +1315,12 @@ fn merge_text_items_with_clips(
     // Sort groups by page then Y descending (top of page first)
     ordered_line_groups.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
 
+    let spaced_glyph_pages = pages_painting_glyph_spaces(&ordered_line_groups);
+
     let mut merged = Vec::new();
 
-    for (_, _, group, preserve_stream_order) in &ordered_line_groups {
+    for (page, _, group, preserve_stream_order) in &ordered_line_groups {
+        let glyph_spaces_painted = spaced_glyph_pages.contains(page);
         let mut i = 0;
         while i < group.len() {
             let first = group[i];
@@ -1383,10 +1433,17 @@ fn merge_text_items_with_clips(
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
                     && !next.text.trim().is_empty();
-                let effective_threshold = match tracked {
+                let mut effective_threshold = match tracked {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
+                if glyph_spaces_painted
+                    && is_bare_ltr_glyph(&previous.text)
+                    && is_bare_ltr_glyph(next.text.trim_end())
+                {
+                    effective_threshold =
+                        effective_threshold.max(first.font_size * HINTED_GLYPH_RESIDUAL_EM);
+                }
                 let bold_boundary = next.is_bold != first.is_bold;
                 let explicit_bold_space = bold_boundary
                     && (text.ends_with(char::is_whitespace)
